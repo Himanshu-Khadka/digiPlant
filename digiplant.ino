@@ -1,154 +1,188 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <DHT.h>
-
-// ----- OLED Display Setup -----
-// Define screen dimensions.
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-// Declare the global display object (must be declared before including RoboEyes.h).
+// Global display object MUST be declared BEFORE including RoboEyes.h
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// ----- DHT22 Sensor Setup -----
-// DHT22 uses 3 pins: VCC, Data, and GND. Use a pull-up resistor (4.7KΩ to 10KΩ) on the Data pin.
-#define DHTPIN 2
+#include <DHT.h>
+#define DHTPIN 2            // DHT22 sensor data pin
 #define DHTTYPE DHT22
 DHT dht(DHTPIN, DHTTYPE);
 
-// ----- Include RoboEyes Library -----
-// The library uses the global "display" object. After including, we undefine the macro 'S'.
 #include <FluxGarage_RoboEyes.h>
-#undef S
+#undef S                    // Remove conflicting macro from RoboEyes
 roboEyes eyes;
 
 // ----- Sensor Pin Definitions -----
-// Capacitive soil moisture sensor (analog) on A0.
-#define SOIL_PIN A0
-// LDR sensor (voltage divider) on A1.
-#define LDR_PIN A1
-// Two capacitive touch sensors on digital pins D4 and D5.
-#define TOUCH1_PIN 4
-#define TOUCH2_PIN 5
-// Piezo buzzer on digital pin D7.
-#define BUZZER_PIN 7
+// ESP32 ADC channels (range 0-4095)
+#define SOIL_PIN 34         // Capacitive soil moisture sensor (analog)
+#define LDR_PIN 35          // LDR sensor via voltage divider (analog)
+#define TOUCH1_PIN 4        // Touch sensor 1 (digital)
+#define TOUCH2_PIN 5        // Touch sensor 2 (digital)
 
-// ----- Thresholds & Timing Settings -----
-// LDR: Lower reading means darker; adjust by calibration.
-const int darkThreshold = 400;
+// ----- WiFi Credentials (hardcoded) -----
+const char* ssid = "Wifi";          // Replace with your WiFi SSID
+const char* password = "pass";   // Replace with your WiFi password
+
+// ----- Timing & Threshold Settings -----
+const int darkThreshold = 2000;          // LDR reading threshold (0-4095); adjust as needed
 unsigned long darkStartTime = 0;
 bool isSleeping = false;
 
-// Soil moisture: Lower reading indicates wet soil.
-const int soilThreshold = 300;
-// Temperature above which the robot appears tired.
-const float tempThreshold = 30.0;
+const int soilThreshold = 1500;          // Soil moisture raw threshold; lower means wetter soil
+const float tempThreshold = 30.0;        // Temperature threshold in °C
 
-// For touch: Show a happy expression for a short duration after touch.
 unsigned long touchTime = 0;
-const unsigned long touchDisplayDuration = 2000; // 2 seconds
+const unsigned long touchDisplayDuration = 2000;  // 2 seconds for HAPPY mood after touch
 
-// Animation settings.
-const int maxFramerate = 30; // For smooth RoboEyes animations.
+// Sensor update interval (non-blocking) in ms:
+const unsigned long sensorInterval = 2000;
+unsigned long lastSensorUpdate = 0;
 
-// For touch tone control: to play the piezo beep only once per new touch event.
-bool touchTriggered = false;
+// Data sending interval:
+const unsigned long sendInterval = 30000;
+unsigned long lastSendTime = 0;
+
+// ----- Server URL -----  
+const char* serverURL = "https://dashboard/update"; // Replace with the URL of your dashboard
 
 void setup() {
-  Serial.begin(9600);
-  Wire.begin();
-
+  Serial.begin(115200);
+  // Connect to WiFi
+  Serial.print("Connecting to WiFi...");
+  WiFi.begin(ssid, password);
+  while(WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.println("Connected. IP: " + WiFi.localIP().toString());
+  
+  // Initialize I2C (default ESP32 pins: SDA=21, SCL=22)
+  Wire.begin(21, 22);
+  
   // Initialize OLED display.
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Use 0x3D if your display uses that address.
-    Serial.println(F("SSD1306 allocation failed"));
-    while (1);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {  // Change to 0x3D if needed
+    Serial.println("SSD1306 allocation failed");
+    while(1);
   }
   display.clearDisplay();
   display.display();
-
+  
+  // Initialize RoboEyes on the OLED.
+  eyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 30);  // 30 FPS for smooth animations
+  eyes.setIdleMode(true, 5, 2);                 // Enable idle animations
+  
   // Initialize DHT22 sensor.
   dht.begin();
-
-  // Initialize RoboEyes.
-  eyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, maxFramerate);
-  // Enable natural idle animations (blinking/eye rolling).
-  eyes.setIdleMode(true, 5, 2);
-
-  // Configure sensor pins.
-  pinMode(SOIL_PIN, INPUT);   // Soil moisture sensor.
-  pinMode(LDR_PIN, INPUT);    // LDR sensor.
-  pinMode(TOUCH1_PIN, INPUT); // Touch sensor 1.
-  pinMode(TOUCH2_PIN, INPUT); // Touch sensor 2.
   
-  // Set buzzer pin as output.
-  pinMode(BUZZER_PIN, OUTPUT);
+  // Set sensor pins.
+  pinMode(SOIL_PIN, INPUT);
+  pinMode(LDR_PIN, INPUT);
+  pinMode(TOUCH1_PIN, INPUT);
+  pinMode(TOUCH2_PIN, INPUT);
 }
 
 void loop() {
-  // ---- Read DHT22 Sensor Data ----
-  float temperature = dht.readTemperature(false); // Get temperature in Celsius.
-  float humidity = dht.readHumidity();              // Get humidity percentage.
-
-  // ---- Read Other Sensors ----
-  int soilValue = analogRead(SOIL_PIN);
-  int ldrValue = analogRead(LDR_PIN);
-  bool touch1Active = (digitalRead(TOUCH1_PIN) == HIGH);
-  bool touch2Active = (digitalRead(TOUCH2_PIN) == HIGH);
-  bool anyTouchActive = touch1Active || touch2Active;
-
-  // Debug output.
-  Serial.print("Temp: "); Serial.print(temperature);
-  Serial.print(" °C, Humidity: "); Serial.print(humidity);
-  Serial.print(" %, Soil: "); Serial.print(soilValue);
-  Serial.print(", LDR: "); Serial.print(ldrValue);
-  Serial.print(", Touch1: "); Serial.print(touch1Active ? "ON" : "OFF");
-  Serial.print(", Touch2: "); Serial.println(touch2Active ? "ON" : "OFF");
-
-  // ---- Determine and Update Expression ----
-  // (1) Check LDR for darkness.
-  if (ldrValue < darkThreshold) {
-    if (darkStartTime == 0) darkStartTime = millis();
-    // If the environment remains dark for 10 seconds, go to sleep.
-    if (millis() - darkStartTime >= 10000) {
-      eyes.close();  // Sleep animation: eyes closed.
-      isSleeping = true;
-    }
-  } else {
-    // Environment is bright; reset dark timer.
-    darkStartTime = 0;
-    if (isSleeping) {
-      eyes.open();  // Wake up.
-      isSleeping = false;
-    }
+  // Always update the RoboEyes animations for smooth motion.
+  eyes.update();
+  
+  // Check if it's time to update sensor readings.
+  if (millis() - lastSensorUpdate >= sensorInterval) {
+    lastSensorUpdate = millis();
     
-    // (2) Check touch sensors.
-    if (anyTouchActive) {
-      touchTime = millis();
-      eyes.setMood(HAPPY);  // Set a happy (loving) expression.
-      // If this is a new touch event, trigger a sweet beep.
-      if (!touchTriggered) {
-        tone(BUZZER_PIN, 1000, 200); // Play a 1 kHz tone for 200 ms.
-        touchTriggered = true;
+    // ---- Read Sensors ----
+    float temperature = dht.readTemperature(false); // in Celsius
+    float humidity = dht.readHumidity();
+    int soilRaw = analogRead(SOIL_PIN);
+    int ldrRaw = analogRead(LDR_PIN);
+    bool touch1Active = (digitalRead(TOUCH1_PIN) == HIGH);
+    bool touch2Active = (digitalRead(TOUCH2_PIN) == HIGH);
+    bool anyTouchActive = touch1Active || touch2Active;
+    
+    // Normalize sensor values (ESP32 ADC: 0-4095)
+    float soilPct = ((4095 - soilRaw) / 4095.0) * 100.0; // Lower reading => wetter soil
+    float ldrPct = (ldrRaw / 4095.0) * 100.0;              // Higher reading => brighter
+    
+    Serial.print("Temp: "); Serial.print(temperature);
+    Serial.print("°C, Hum: "); Serial.print(humidity);
+    Serial.print("%, Soil: "); Serial.print(soilPct);
+    Serial.print("%, LDR: "); Serial.print(ldrPct);
+    Serial.print("%, Touch: "); Serial.println(anyTouchActive ? "Yes" : "No");
+    
+    // ---- Update RoboEyes Expression ----
+    if (ldrRaw < darkThreshold) {
+      if (darkStartTime == 0)
+        darkStartTime = millis();
+      if (millis() - darkStartTime >= 10000) {  // If dark for 10 sec, sleep
+        eyes.close();
+        isSleeping = true;
       }
     } else {
-      touchTriggered = false; // Reset when no touch is detected.
-      // (3) If a recent touch occurred, maintain happy expression.
-      if (millis() - touchTime < touchDisplayDuration) {
+      darkStartTime = 0;
+      if (isSleeping) {
+        eyes.open();
+        isSleeping = false;
+      }
+      if (anyTouchActive) {
+        touchTime = millis();
         eyes.setMood(HAPPY);
       }
-      // (4) Otherwise, if soil is wet or temperature is high, show tired expression.
-      else if (soilValue < soilThreshold || temperature > tempThreshold) {
+      else if (millis() - touchTime < touchDisplayDuration) {
+        eyes.setMood(HAPPY);
+      }
+      else if (soilRaw < soilThreshold || temperature > tempThreshold) {
         eyes.setMood(TIRED);
       }
-      // (5) Default mood.
       else {
         eyes.setMood(DEFAULT);
       }
     }
+    
+    // ---- Send Sensor Data to Server Periodically ----
+    if (millis() - lastSendTime > sendInterval) {
+      sendSensorData(temperature, humidity, soilPct, ldrPct);
+      lastSendTime = millis();
+    }
   }
   
-  // ---- Update the Animated Display ----
-  eyes.update();  // Must be called frequently for smooth animations.
-  
-  delay(50);  // Short delay for timing.
+  // Short delay to avoid overloading the loop (but keep it smooth)
+  delay(20);
 }
+
+void sendSensorData(float temp, float hum, float soil, float ldr) {
+  // Construct URL with query parameters.
+  String url = String(serverURL);
+  url += "?device=plant1";
+  url += "&temp=" + String(temp, 1);
+  url += "&hum=" + String(hum, 1);
+  url += "&soil=" + String(soil, 1);
+  url += "&ldr=" + String(ldr, 1);
+  
+  Serial.println("Sending data: " + url);
+  
+  WiFiClientSecure client;
+  client.setInsecure();  // For testing only; in production, validate the certificate
+  
+  HTTPClient http;
+  if(http.begin(client, url)) {  // HTTPS connection
+    int httpCode = http.GET();
+    if(httpCode > 0) {
+      Serial.println("HTTP GET code: " + String(httpCode));
+      String payload = http.getString();
+      Serial.println("Response: " + payload);
+    } else {
+      Serial.println("GET request failed: " + String(http.errorToString(httpCode).c_str()));
+    }
+    http.end();
+  } else {
+    Serial.println("Unable to connect to server");
+  }
+}
+
